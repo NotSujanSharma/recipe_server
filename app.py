@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, Text
@@ -8,6 +8,8 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from typing import List, Optional
 from pydantic import BaseModel
 import jwt
+import json
+import mammoth
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from typing import List
@@ -26,7 +28,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # JWT settings
 SECRET_KEY = "your-secret-key"  # Change this in production!
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 1440
+access_EXPIRE_MINUTES = 1440
 
 class LocationCheck(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
@@ -35,6 +37,17 @@ class LocationCheck(BaseModel):
 class LocationResponse(BaseModel):
     allowed: bool
     message: str
+
+class LocationSettings(BaseModel):
+    latitude: float
+    longitude: float
+    radius_km: float
+
+class RecipeCreate(BaseModel):
+    name: str
+    category: str
+    file: str
+    photo: Optional[str] = None
 
 # Add this configuration after your JWT settings
 # Configure the center point and radius of your allowed region
@@ -104,9 +117,6 @@ class RecipeBase(BaseModel):
     ingredients: List[str]
     steps: List[str]
 
-class RecipeCreate(RecipeBase):
-    pass
-
 class Recipe_db_out(BaseModel):
     id: int
     name: str
@@ -125,7 +135,7 @@ class RecipeOut(RecipeBase):
         orm_mode = True
 
 class Token(BaseModel):
-    access_token: str
+    access: str
     token_type: str
 
 # Helper functions
@@ -152,9 +162,9 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
-def create_access_token(data: dict):
+def create_access(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + timedelta(minutes=access_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -188,7 +198,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.get("/verify-token", response_model=UserResponse)
+@app.post("/token/verify/", response_model=UserResponse)
 async def verify_token(current_user: User = Depends(get_current_user)):
     """
     Verifies the token from Authorization header and returns user data if valid.
@@ -196,7 +206,113 @@ async def verify_token(current_user: User = Depends(get_current_user)):
     """
     return {"user": current_user}
 
-@app.post("/api/verify-location", response_model=LocationResponse)
+@app.post("/api/admin/upload-recipe")
+async def upload_recipe(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    print(file.filename)
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    if not file.filename.endswith('.docx'):
+        raise HTTPException(status_code=400, detail="Only DOCX files are allowed")
+    
+    try:
+        # Read the uploaded file
+        content = await file.read()
+        
+        # Convert DOCX to HTML using mammoth
+        result = mammoth.convert_to_html(content)
+        html = result.value
+        print(html)
+        
+        # Create recipe name from filename (without extension)
+        name = file.filename.rsplit('.', 1)[0]
+        
+        # Create new recipe in database
+        db = SessionLocal()
+        new_recipe = Recipe_db(
+            name=name,
+            category="uncategorized",
+            file=html,
+            photo="null"
+        )
+        db.add(new_recipe)
+        db.commit()
+        db.refresh(new_recipe)
+        
+        return {"message": "Recipe uploaded successfully", "recipe": new_recipe}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/admin/recipes/{recipe_id}")
+async def update_recipe(
+    recipe_id: int,
+    recipe: RecipeCreate,
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    db = SessionLocal()
+    db_recipe = db.query(Recipe_db).filter(Recipe_db.id == recipe_id).first()
+    if not db_recipe:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    
+    for key, value in recipe.dict().items():
+        setattr(db_recipe, key, value)
+    
+    db.commit()
+    db.refresh(db_recipe)
+    return db_recipe
+
+@app.delete("/api/admin/recipes/{recipe_id}")
+async def delete_recipe(
+    recipe_id: int,
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    db = SessionLocal()
+    recipe = db.query(Recipe_db).filter(Recipe_db.id == recipe_id).first()
+    if not recipe:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    
+    db.delete(recipe)
+    db.commit()
+    return {"message": "Recipe deleted successfully"}
+
+@app.get("/api/admin/location-settings")
+async def get_location_settings(current_user: User = Depends(get_current_user)):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    return {
+        "latitude": ALLOWED_REGION["center"]["latitude"],
+        "longitude": ALLOWED_REGION["center"]["longitude"],
+        "radius_km": ALLOWED_REGION["radius_km"]
+    }
+
+@app.put("/api/admin/location-settings")
+async def update_location_settings(
+    settings: LocationSettings,
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Update the global settings
+    ALLOWED_REGION["center"]["latitude"] = settings.latitude
+    ALLOWED_REGION["center"]["longitude"] = settings.longitude
+    ALLOWED_REGION["radius_km"] = settings.radius_km
+    
+    # In a production environment, you'd want to persist these changes to a database
+    return {"message": "Location settings updated successfully"}
+
+@app.post("/location/verify_location/", response_model=LocationResponse)
 async def verify_location(
     location: LocationCheck,
     current_user: User = Depends(get_current_user)
@@ -215,7 +331,7 @@ async def verify_location(
     )
 # Auth endpoints
 @app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+async def login_for_access(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
@@ -223,8 +339,8 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    access_token = create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
+    access = create_access(data={"sub": user.username})
+    return {"access": access, "token_type": "bearer"}
 
 # User endpoints
 @app.post("/users/", response_model=UserOut)
@@ -289,4 +405,4 @@ def get_recipe(recipe_id: int, db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9292)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
