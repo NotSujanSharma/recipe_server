@@ -8,6 +8,8 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from typing import List, Optional
 from pydantic import BaseModel
 import jwt
+from io import BytesIO
+import traceback
 import json
 import mammoth
 from datetime import datetime, timedelta
@@ -211,41 +213,75 @@ async def upload_recipe(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
-    print(file.filename)
+    print("=== Starting upload_recipe function ===")
+    print(f"Received file: {file.filename}")
+    print(f"User: {current_user.email}, Is superuser: {current_user.is_superuser}")
+
     if not current_user.is_superuser:
+        print("Authorization failed: User is not superuser")
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+   
     if not file.filename.endswith('.docx'):
+        print(f"Invalid file type: {file.filename}")
         raise HTTPException(status_code=400, detail="Only DOCX files are allowed")
+   
+    # Initialize db as None outside try block
+    db: Optional[Session] = None
     
     try:
-        # Read the uploaded file
+        print("Attempting to read file content...")
         content = await file.read()
-        
-        # Convert DOCX to HTML using mammoth
-        result = mammoth.convert_to_html(content)
+        print(f"Successfully read file, content length: {len(content)} bytes")
+       
+        print("Converting DOCX to HTML...")
+        # Create a BytesIO object from the content
+        docx_file = BytesIO(content)
+        result = mammoth.convert_to_html(docx_file)
         html = result.value
-        print(html)
-        
-        # Create recipe name from filename (without extension)
+        print("HTML conversion completed")
+        print(f"HTML content preview (first 200 chars): {html[:200]}")
+       
+        print("Processing filename...")
         name = file.filename.rsplit('.', 1)[0]
-        
-        # Create new recipe in database
+        print(f"Generated recipe name: {name}")
+       
+        print("Initializing database connection...")
         db = SessionLocal()
+        
+        print("Creating new recipe object...")
         new_recipe = Recipe_db(
             name=name,
             category="uncategorized",
             file=html,
             photo="null"
         )
+        
+        print("Adding recipe to database...")
         db.add(new_recipe)
+        
+        print("Committing transaction...")
         db.commit()
+        
+        print("Refreshing recipe object...")
         db.refresh(new_recipe)
         
+        print("Upload completed successfully")
         return {"message": "Recipe uploaded successfully", "recipe": new_recipe}
+    
     except Exception as e:
+        print(f"=== ERROR OCCURRED ===")
+        print(f"Error type: {type(e)}")
+        print(f"Error message: {str(e)}")
+        print(f"Error details: {repr(e)}")
+        print("Stack trace:")
+        print(traceback.format_exc())
+        
         raise HTTPException(status_code=500, detail=str(e))
-
+    finally:
+        # Only close if db was initialized
+        if db is not None:
+            print("Closing database connection...")
+            db.close()
 
 @app.put("/api/admin/recipes/{recipe_id}")
 async def update_recipe(
