@@ -283,6 +283,26 @@ async def upload_recipe(
             print("Closing database connection...")
             db.close()
 
+@app.post("/api/admin/recipes")
+async def create_recipe(
+    recipe: RecipeCreate,
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    db = SessionLocal()
+    db_recipe = Recipe_db(
+        name=recipe.name,
+        category=recipe.category,
+        file=recipe.file,
+        photo=recipe.photo
+    )
+    db.add(db_recipe)
+    db.commit()
+    db.refresh(db_recipe)
+    return db_recipe
+
 @app.put("/api/admin/recipes/{recipe_id}")
 async def update_recipe(
     recipe_id: int,
